@@ -1,0 +1,67 @@
+import { memo } from 'react';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+import { Colors, Radius, Spacing, Typography } from '@/constants/theme';
+import { vipPaymentRevision } from '@/constants/vipPayment';
+import { useVipPaymentDiagnostics } from '@/hooks/useVipPaymentDiagnostics';
+
+interface PaymentDiagnosticsPanelProps { compact?: boolean }
+
+export const PaymentDiagnosticsPanel = memo(function PaymentDiagnosticsPanel({ compact = false }: PaymentDiagnosticsPanelProps) {
+  const { running, report, expanded, runChecks, shareReport, toggleExpanded } = useVipPaymentDiagnostics();
+  return (
+    <View style={[styles.panel, compact ? styles.compact : null]}>
+      <Pressable
+        style={({ pressed }) => [styles.checkButton, pressed ? styles.pressed : null]}
+        onPress={runChecks}
+        disabled={running}
+        accessibilityRole="button"
+        accessibilityLabel="付款連線檢查，不會扣款"
+        accessibilityState={{ disabled: running, busy: running }}
+      >
+        {running ? <ActivityIndicator size="small" color={Colors.textSecondary} /> : <MaterialIcons name="network-check" size={20} color={Colors.textSecondary} />}
+        <Text style={styles.buttonText}>{running ? '正在檢查付款連線...' : '付款連線檢查（不會扣款）'}</Text>
+      </Pressable>
+      <Text style={styles.version}>付款版本：{vipPaymentRevision}</Text>
+      {report ? (
+        <View style={styles.reportBlock}>
+          <View style={styles.actions}>
+            <Pressable style={({ pressed }) => [styles.action, pressed ? styles.pressed : null]} onPress={toggleExpanded} accessibilityRole="button" accessibilityLabel={expanded ? '收起付款報告' : '顯示付款報告'}>
+              <MaterialIcons name={expanded ? 'expand-less' : 'expand-more'} size={20} color={Colors.textSecondary} />
+              <Text style={styles.actionText}>{expanded ? '收起報告' : '顯示報告'}</Text>
+            </Pressable>
+            <Pressable style={({ pressed }) => [styles.action, pressed ? styles.pressed : null, running ? styles.disabled : null]} onPress={shareReport} disabled={running} accessibilityRole="button" accessibilityLabel="分享付款檢查報告">
+              <MaterialIcons name="share" size={18} color={Colors.textSecondary} />
+              <Text style={styles.actionText}>分享報告</Text>
+            </Pressable>
+          </View>
+          {expanded ? (
+            <View style={styles.reportViewport}>
+              <ScrollView style={styles.reportScroll} contentContainerStyle={styles.reportContent} nestedScrollEnabled showsVerticalScrollIndicator={false}>
+                <Text style={styles.reportText} selectable accessibilityLiveRegion="polite">{report}</Text>
+              </ScrollView>
+            </View>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+});
+
+const styles = StyleSheet.create({
+  panel: { padding: Spacing.md, gap: Spacing.sm, backgroundColor: Colors.surface, borderRadius: Radius.md, borderWidth: 1, borderColor: Colors.surfaceBorder },
+  compact: { padding: Spacing.sm },
+  checkButton: { minHeight: Spacing.xxl, flexDirection: 'row', gap: Spacing.sm, alignItems: 'center' },
+  buttonText: { fontSize: Typography.base, fontWeight: Typography.semibold, color: Colors.textSecondary, flexShrink: 1, includeFontPadding: false },
+  version: { fontSize: Typography.xs, color: Colors.textSecondary, includeFontPadding: false },
+  reportBlock: { gap: Spacing.sm },
+  actions: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: Spacing.sm },
+  action: { minHeight: Spacing.xxl, paddingHorizontal: Spacing.sm, flexDirection: 'row', alignItems: 'center', gap: Spacing.xs },
+  actionText: { fontSize: Typography.sm, fontWeight: Typography.semibold, color: Colors.textSecondary },
+  reportViewport: { height: Spacing.xxl * 5, backgroundColor: Colors.background, borderRadius: Radius.sm },
+  reportScroll: { flex: 1 },
+  reportContent: { padding: Spacing.md },
+  reportText: { fontSize: Typography.base, lineHeight: Typography.base * 1.6, color: Colors.textPrimary, includeFontPadding: false },
+  pressed: { opacity: 0.7 },
+  disabled: { opacity: 0.5 },
+});

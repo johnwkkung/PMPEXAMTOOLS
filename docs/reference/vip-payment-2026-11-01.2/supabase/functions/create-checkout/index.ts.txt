@@ -1,0 +1,6 @@
+import { handleVipCheckout } from '../_shared/vipCheckout.ts';
+
+// Compatibility route for existing installed apps. New builds use the responding
+// check-subscription payment dispatcher. GET is a read-only deployment probe.
+// Wrap explicitly: Deno's second handler argument is server info, not JSON input.
+Deno.serve((req: Request) => handleVipCheckout(req));

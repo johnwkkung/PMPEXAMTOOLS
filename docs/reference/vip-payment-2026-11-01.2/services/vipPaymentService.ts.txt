@@ -1,0 +1,183 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { FunctionsHttpError } from '@supabase/supabase-js';
+import { getSupabaseClient } from '@/template';
+import { vipPaymentEndpoint, vipPaymentRevision, vipPaymentTimeoutMs } from '@/constants/vipPayment';
+
+export interface PaymentResult<T> {
+  data: T | null;
+  error: string | null;
+  code?: string;
+  requestId?: string;
+  stage?: string;
+  revision?: string;
+}
+export interface VipCheckout { url: string | null; session_id: string; paid: boolean; payment_intent_id?: string | null }
+export interface VipSubscription { subscribed: boolean; subscription_end?: string | null }
+export interface VerifiedVipCheckout { paid: boolean; session_id: string; status: string; payment_status: string; payment_intent_id?: string | null }
+interface CheckoutAttempt { userId: string; id: string; createdAt: number }
+interface PaymentDiagnostics {
+  healthy: boolean;
+  revision?: string;
+  request_id?: string;
+  price_id?: string;
+  price_active?: boolean;
+  currency?: string;
+  amount?: number;
+  recent_attempts?: { attempt_id: string; created_at: string; checkout_session_id: string | null }[];
+  latest_payment?: VerifiedVipCheckout | null;
+  note?: string;
+}
+const unresolvedMessage = '付款服務回應逾時，付款狀態尚未確認。請勿重複付款；稍後重試會沿用同一付款請求。';
+let checkoutAttempt: CheckoutAttempt | null = null;
+const attemptStorageKey = (userId: string) => `vip-checkout-attempt:${userId}`;
+
+async function getCheckoutAttempt(userId: string): Promise<CheckoutAttempt> {
+  if (!checkoutAttempt || checkoutAttempt.userId !== userId) {
+    const stored = await AsyncStorage.getItem(attemptStorageKey(userId));
+    let candidate: CheckoutAttempt | null = null;
+    try { candidate = stored ? JSON.parse(stored) as CheckoutAttempt : null; } catch { /* Ignore corrupt local data. */ }
+    checkoutAttempt = candidate?.userId === userId && /^[a-zA-Z0-9_-]{8,80}$/.test(candidate.id)
+      && Number.isFinite(candidate.createdAt) ? candidate : null;
+  }
+  // An old unresolved attempt must not silently become a new payment request.
+  // The server checks old session status before the UI can explicitly replace it.
+  if (!checkoutAttempt) {
+    checkoutAttempt = { userId, createdAt: Date.now(), id: `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}` };
+    // Persist BEFORE sending: a restart after a timeout must reuse the same key.
+    await AsyncStorage.setItem(attemptStorageKey(userId), JSON.stringify(checkoutAttempt));
+  }
+  return checkoutAttempt;
+}
+
+async function parsePaymentError(error: unknown): Promise<PaymentResult<never>> {
+  if (error instanceof FunctionsHttpError) {
+    const status = error.context?.status ?? 500;
+    let body: Record<string, unknown> = {};
+    try {
+      const text = await error.context.text();
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+      } catch { /* Gateway HTML is never shown in the UI. */ }
+    } catch { /* Response body may be unavailable after an abort. */ }
+    const code = typeof body.code === 'string' ? body.code : `http_${status}`;
+    const requestId = typeof body.request_id === 'string' ? body.request_id : undefined;
+    const stage = typeof body.stage === 'string' ? body.stage : undefined;
+    const revision = typeof body.revision === 'string' ? body.revision : undefined;
+    let message: string;
+    if (status === 401 || code === 'authentication_required') message = '登入狀態已失效，請重新登入後再試。';
+    else if (status === 408 || status === 504 || status === 499 || code === 'upstream_timeout') message = unresolvedMessage;
+    else if (code === 'configuration_error') message = '付款服務設定未完成，請聯絡管理員。';
+    else {
+      const detail = typeof body.error === 'string' ? body.error : '';
+      message = detail && !/<\/?[a-z][\s\S]*>/i.test(detail) ? detail.slice(0, 400) : `付款服務暫時無法使用，請稍後再試。（${status}）`;
+    }
+    return { data: null, error: message, code, requestId, stage, revision };
+  }
+  return { data: null, error: '無法連接付款服務，付款狀態尚未確認。請檢查網絡後重試同一請求。', code: 'network_error' };
+}
+
+async function invokePayment<T>(
+  functionName: string,
+  createBody: (userId: string) => Record<string, unknown> | Promise<Record<string, unknown>>,
+  parentSignal?: AbortSignal,
+  method: 'GET' | 'POST' = 'POST',
+): Promise<PaymentResult<T>> {
+  const controller = new AbortController();
+  let timedOut = false;
+  let resolveAborted: (value: PaymentResult<T>) => void = () => {};
+  const aborted = new Promise<PaymentResult<T>>((resolve) => { resolveAborted = resolve; });
+  const abort = () => {
+    controller.abort();
+    resolveAborted({ data: null, error: timedOut ? unresolvedMessage : null, code: timedOut ? 'timeout' : 'cancelled' });
+  };
+  parentSignal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => { timedOut = true; abort(); }, vipPaymentTimeoutMs);
+  if (parentSignal?.aborted) abort();
+  const operation = (async (): Promise<PaymentResult<T>> => {
+    try {
+      if (controller.signal.aborted) return { data: null, error: null, code: 'cancelled' };
+      const supabase = getSupabaseClient();
+      const { data: { session }, error: sessionError } = await supabase.auth.getSession();
+      if (controller.signal.aborted) return { data: null, error: null, code: 'cancelled' };
+      if (sessionError || !session) return { data: null, error: '請重新登入後再試。', code: 'authentication_required' };
+      const body = method === 'POST' ? await createBody(session.user.id) : undefined;
+      if (controller.signal.aborted) return { data: null, error: null, code: 'cancelled' };
+      const { data, error } = await supabase.functions.invoke<T>(functionName, {
+        method, ...(body ? { body } : {}), headers: { Authorization: `Bearer ${session.access_token}` }, signal: controller.signal,
+      });
+      if (error) return await parsePaymentError(error);
+      const metadata = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+      return { data, error: null, revision: typeof metadata.revision === 'string' ? metadata.revision : undefined,
+        requestId: typeof metadata.request_id === 'string' ? metadata.request_id : undefined };
+    } catch (error) {
+      return await parsePaymentError(error);
+    }
+  })();
+  try { return await Promise.race([operation, aborted]); }
+  finally { clearTimeout(timer); parentSignal?.removeEventListener('abort', abort); }
+}
+
+function withCheckoutReference<T>(result: PaymentResult<T>): PaymentResult<T> {
+  if (!result.error) return result;
+  const reference = result.requestId ?? checkoutAttempt?.id;
+  return { ...result, error: `${result.error}\n代碼：${result.code ?? 'unknown'}${result.stage ? ` · ${result.stage}` : ''}${reference ? `\n參考編號：${reference}` : ''}\n付款版本：${vipPaymentRevision}` };
+}
+
+export async function createVipCheckout(signal?: AbortSignal): Promise<PaymentResult<VipCheckout>> {
+  const result = await invokePayment<VipCheckout>(vipPaymentEndpoint, async (userId) => {
+    const attempt = await getCheckoutAttempt(userId);
+    return { action: 'create_checkout', requestId: attempt.id };
+  }, signal);
+  if (result.error || result.code === 'cancelled') return withCheckoutReference(result);
+  if (result.revision !== vipPaymentRevision) {
+    return withCheckoutReference({ data: null, error: '付款伺服器版本尚未更新，請稍後再試並提供付款連線檢查報告。', code: 'payment_version_mismatch' });
+  }
+  if (!result.data?.session_id || (result.data.paid !== true && (!result.data.url || !/^https:\/\/checkout\.stripe\.com\//i.test(result.data.url)))) {
+    return withCheckoutReference({ data: null, error: '無法取得有效付款連結，請稍後再試。', code: 'invalid_checkout_url' });
+  }
+  return result;
+}
+
+export async function clearVipCheckoutAttempt(userId?: string): Promise<void> {
+  const id = userId ?? checkoutAttempt?.userId;
+  if (id) await AsyncStorage.removeItem(attemptStorageKey(id));
+  if (!userId || checkoutAttempt?.userId === userId) checkoutAttempt = null;
+}
+export function verifyVipCheckout(sessionId: string, signal?: AbortSignal): Promise<PaymentResult<VerifiedVipCheckout>> {
+  return invokePayment<VerifiedVipCheckout>(vipPaymentEndpoint, () => ({ action: 'verify_checkout', sessionId }), signal);
+}
+export function fetchVipSubscription(signal?: AbortSignal): Promise<PaymentResult<VipSubscription>> {
+  return invokePayment<VipSubscription>('check-subscription', () => ({}), signal);
+}
+
+export async function runVipPaymentDiagnostics(signal?: AbortSignal): Promise<string> {
+  const started = new Date().toISOString();
+  const startedMs = Date.now();
+  const [checkoutProbe, paymentProbe] = await Promise.all([
+    // GET cannot create a payment even if an older create-checkout function is deployed.
+    invokePayment<PaymentDiagnostics>('create-checkout', () => ({}), signal, 'GET'),
+    invokePayment<PaymentDiagnostics>(vipPaymentEndpoint, () => ({ action: 'diagnostics' }), signal),
+  ]);
+  const formatProbe = (name: string, result: PaymentResult<PaymentDiagnostics>) => {
+    if (result.error || result.code) return `${name}: ${result.code ?? 'error'}\n${result.error ?? 'Cancelled'}${result.stage ? `\nStage: ${result.stage}` : ''}${result.requestId ? `\nRequest: ${result.requestId}` : ''}`;
+    if (!result.data?.revision) return `${name}: responded, but the diagnostic revision is missing (older backend deployment)`;
+    return `${name}: OK\nBackend revision: ${result.data.revision}${result.requestId ? `\nRequest: ${result.requestId}` : ''}`;
+  };
+  const client = getSupabaseClient();
+  const backendUrl = (client as unknown as { supabaseUrl?: string }).supabaseUrl ?? 'Configured OnSpace Cloud backend';
+  const details = paymentProbe.data;
+  const latest = details?.latest_payment;
+  const attempts = details?.recent_attempts ?? [];
+  return [
+    `Payment diagnostics · ${started}`, `Client revision: ${vipPaymentRevision}`, `Backend: ${backendUrl}`,
+    `Checkout route: ${vipPaymentEndpoint}`, `Elapsed: ${Date.now() - startedMs} ms`,
+    formatProbe('create-checkout GET (gateway/liveness)', checkoutProbe),
+    formatProbe(`${vipPaymentEndpoint} POST (authentication/Stripe/storage)`, paymentProbe),
+    details?.price_id ? `Stripe price: ${details.price_id}\nActive: ${String(details.price_active)}\nAmount: ${(details.amount ?? 0) / 100} ${details.currency?.toUpperCase()}` : '',
+    latest ? `Latest recorded Stripe session: ${latest.session_id}\nPaymentIntent: ${latest.payment_intent_id ?? 'Not yet assigned'}\nSession: ${latest.status}\nPayment status: ${latest.payment_status}` : 'No recorded Stripe session reference found; this does not prove an older attempt failed.',
+    attempts.length ? `Recent attempt references:\n${attempts.map((entry) => `${entry.created_at} · ${entry.attempt_id} · ${entry.checkout_session_id ?? 'Outcome unresolved / no session recorded'}`).join('\n')}` : '',
+    checkoutAttempt ? `Retained client attempt: ${checkoutAttempt.id}` : '',
+    'Read-only checks: no checkout was created and no card was charged. Do not send passwords or access tokens with this report.',
+  ].filter(Boolean).join('\n\n');
+}

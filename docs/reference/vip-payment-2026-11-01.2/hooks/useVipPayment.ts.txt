@@ -1,0 +1,140 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AppState } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
+import { useAlert, useAuth } from '@/template';
+import { createVipCheckout, clearVipCheckoutAttempt, fetchVipSubscription, verifyVipCheckout } from '@/services/vipPaymentService';
+import { callUpgrade } from '@/services/userManagerService';
+
+type PaymentStage = 'idle' | 'preparing' | 'opening' | 'checking';
+interface VipPaymentOptions { onPaymentSuccess: () => void }
+
+export function useVipPayment({ onPaymentSuccess }: VipPaymentOptions) {
+  const { user } = useAuth();
+  const { showAlert } = useAlert();
+  const [stage, setStage] = useState<PaymentStage>('idle');
+  const [subscriptionEnd, setSubscriptionEnd] = useState<string | null>(null);
+  const mounted = useRef(false);
+  const checkoutInFlight = useRef(false);
+  const checkoutController = useRef<AbortController | null>(null);
+  const subscriptionController = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      checkoutController.current?.abort();
+      subscriptionController.current?.abort();
+    };
+  }, []);
+
+  const checkSubscription = useCallback(async () => {
+    if (!user?.id || subscriptionController.current) return;
+    const controller = new AbortController();
+    subscriptionController.current = controller;
+    try {
+      const result = await fetchVipSubscription(controller.signal);
+      if (controller.signal.aborted || !mounted.current) return;
+      if (result.error) {
+        console.warn('[check-subscription]', { code: result.code });
+        return;
+      }
+      setSubscriptionEnd(result.data?.subscribed ? result.data.subscription_end ?? null : null);
+    } finally {
+      if (subscriptionController.current === controller) subscriptionController.current = null;
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
+    setSubscriptionEnd(null);
+    void checkSubscription();
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void checkSubscription();
+    });
+    return () => {
+      subscription.remove();
+      subscriptionController.current?.abort();
+      subscriptionController.current = null;
+      checkoutController.current?.abort();
+    };
+  }, [checkSubscription]);
+
+  const completeVerifiedPayment = useCallback(async () => {
+    try { await clearVipCheckoutAttempt(user?.id); }
+    catch { console.warn('[VIP-PAYMENT] local attempt cleanup unavailable'); }
+    // Preserve the existing external VIP upgrade flow, but only AFTER server verification.
+    if (user?.email) {
+      void callUpgrade({ useremail: user.email }).then((upgrade) => {
+        if (!upgrade.success) console.warn('[callUpgrade] failed');
+      }).catch(() => console.warn('[callUpgrade] unavailable'));
+    }
+    if (mounted.current) onPaymentSuccess();
+  }, [user?.id, user?.email, onPaymentSuccess]);
+
+  const startCheckout = useCallback(async (): Promise<void> => {
+    if (checkoutInFlight.current) return;
+    if (!user?.email) {
+      showAlert('請先登入', '請重新登入後再試。');
+      return;
+    }
+    checkoutInFlight.current = true;
+    const controller = new AbortController();
+    checkoutController.current = controller;
+    setStage('preparing');
+    try {
+      const checkout = await createVipCheckout(controller.signal);
+      if (!mounted.current || controller.signal.aborted) return;
+      if (checkout.error || !checkout.data) {
+        if (checkout.code === 'checkout_expired') {
+          showAlert('付款連結已過期', 'Stripe 已確認原付款連結已過期且未付款。是否建立新付款連結？', [
+            { text: '取消', style: 'cancel' },
+            { text: '建立新連結', onPress: async () => {
+              try {
+                await clearVipCheckoutAttempt(user?.id);
+                void startCheckout();
+              } catch { showAlert('無法重設', '請稍後再試。'); }
+            } },
+          ]);
+        } else {
+          showAlert('付款服務未能完成', checkout.error ?? '無法取得付款連結。請執行下方付款連線檢查並提供報告。');
+        }
+        return;
+      }
+      // A timed-out earlier request may already have completed; never ask the user to pay again.
+      if (checkout.data.paid) {
+        await completeVerifiedPayment();
+        return;
+      }
+      if (!checkout.data.url) return;
+      setStage('opening');
+      const result = await WebBrowser.openAuthSessionAsync(checkout.data.url, 'onspaceapp://subscription');
+      if (!mounted.current || controller.signal.aborted) return;
+      if (result.type === 'success' && result.url?.startsWith('onspaceapp://subscription/success')) {
+        setStage('checking');
+        const verification = await verifyVipCheckout(checkout.data.session_id, controller.signal);
+        if (!mounted.current || controller.signal.aborted) return;
+        if (verification.error || !verification.data?.paid) {
+          showAlert('付款狀態尚未確認', `${verification.error ?? 'Stripe 尚未確認收到付款。'}\n請勿重複付款；稍後重試會沿用同一請求。\nCheckout：${checkout.data.session_id}`);
+          return;
+        }
+        await completeVerifiedPayment();
+      } else {
+        // Browser dismissal/cancellation does not prove the payment failed. Retain the attempt.
+        setStage('checking');
+        await checkSubscription();
+      }
+    } catch {
+      if (mounted.current && !controller.signal.aborted) {
+        showAlert('付款服務未能完成', '無法開啟付款頁面，請稍後重試。原付款請求已保留，請勿重複付款。');
+      }
+    } finally {
+      checkoutInFlight.current = false;
+      if (checkoutController.current === controller) checkoutController.current = null;
+      if (mounted.current) setStage('idle');
+    }
+  }, [user?.id, user?.email, showAlert, completeVerifiedPayment, checkSubscription]);
+
+  const paymentStatus = stage === 'preparing' ? '正在連接付款服務，最長等候 30 秒。重試會沿用同一付款請求。'
+    : stage === 'opening' ? '請在付款頁面完成或取消付款。'
+    : stage === 'checking' ? '正在向 Stripe 確認付款狀態，最長等候 30 秒。' : '';
+  return { checkingOut: stage !== 'idle', paymentStatus, subscriptionEnd, startCheckout };
+}

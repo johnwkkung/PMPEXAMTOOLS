@@ -1,0 +1,17 @@
+🔵 Work Left - Hours (Blue curve)
+Work Dates,Hours of work remaining (hours)
+4/30,500
+5/2,450
+5/4,250
+5/5,200
+5/6,70
+
+
+🔴 Ideal Burndown (Red curve)
+Work Dates,Hours of work remaining (hours)
+4/30,500
+5/2,400
+5/4,300
+5/5,200
+5/6,100
+5/7,0

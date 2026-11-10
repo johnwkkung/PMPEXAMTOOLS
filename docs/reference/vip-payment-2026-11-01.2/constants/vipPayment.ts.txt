@@ -1,0 +1,6 @@
+// Change this revision whenever the device payment flow changes.
+export const vipPaymentRevision = 'vip-payment-2026-11-01.2';
+// Checkout uses the endpoint whose authentication and Stripe access were verified in logs.
+export const vipPaymentEndpoint = 'check-subscription';
+export const vipPaymentTimeoutMs = 30000;
+export const vipCheckoutAttemptLifetimeMs = 23 * 60 * 60 * 1000;

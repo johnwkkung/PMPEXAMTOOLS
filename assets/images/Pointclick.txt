@@ -1,0 +1,21 @@
+Curve,Dollar,Percentage
+Before Mitigation,5500,0
+Before Mitigation,6000,1
+Before Mitigation,6500,3
+Before Mitigation,7000,9
+Before Mitigation,7500,20
+Before Mitigation,8000,62
+Before Mitigation,8500,82
+Before Mitigation,9000,88
+Before Mitigation,9500,95
+Before Mitigation,10000,100
+After Mitigation,5500,0
+After Mitigation,6000,2
+After Mitigation,6500,6
+After Mitigation,7000,15
+After Mitigation,7500,48
+After Mitigation,8000,80
+After Mitigation,8500,90
+After Mitigation,9000,95
+After Mitigation,9500,97
+After Mitigation,10000,100

@@ -1,0 +1,41 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Share } from 'react-native';
+import { useAlert } from '@/template';
+import { runVipPaymentDiagnostics } from '@/services/vipPaymentService';
+
+export function useVipPaymentDiagnostics() {
+  const { showAlert } = useAlert();
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState('');
+  const [expanded, setExpanded] = useState(false);
+  const controller = useRef<AbortController | null>(null);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; controller.current?.abort(); };
+  }, []);
+  const runChecks = useCallback(async () => {
+    if (controller.current) return;
+    const current = new AbortController();
+    controller.current = current;
+    setRunning(true);
+    setExpanded(true);
+    setReport('正在檢查閘道、伺服器版本、登入認證及 Stripe 連線。最長等候 30 秒；不會建立付款或扣款。');
+    try {
+      const result = await runVipPaymentDiagnostics(current.signal);
+      if (mounted.current && !current.signal.aborted) setReport(result);
+    } catch {
+      if (mounted.current && !current.signal.aborted) setReport('無法完成檢查，請確認網絡後再試。');
+    } finally {
+      if (controller.current === current) controller.current = null;
+      if (mounted.current) setRunning(false);
+    }
+  }, []);
+  const shareReport = useCallback(async () => {
+    if (!report || running) return;
+    try { await Share.share({ message: report, title: 'VIP payment diagnostics' }); }
+    catch { showAlert('無法分享', '請長按檢查報告文字並複製。'); }
+  }, [report, running, showAlert]);
+  const toggleExpanded = useCallback(() => setExpanded((value) => !value), []);
+  return { running, report, expanded, runChecks, shareReport, toggleExpanded };
+}
